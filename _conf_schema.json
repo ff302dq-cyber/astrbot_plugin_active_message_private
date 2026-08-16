@@ -1,0 +1,141 @@
+{
+    "decision_provider_id": {
+        "type": "string",
+        "description": "决策模型服务商",
+        "hint": "选择专用于主动消息内容和跟进意图判断的模型提供商，留空使用默认模型。发送时间始终由代码随机，不由模型决定。",
+        "default": "",
+        "_special": "select_provider"        
+    }, 
+    "decision_making_config": {
+        "description": "活着的Ta 功能开关",
+        "type": "object",
+        "items": {
+            "enable_decision_making": {
+                "type": "bool",
+                "description": "启用对话后决策/跟进功能",
+                "hint": "开启后，每次对话结束时，TA会根据记忆与聊天内容决定之后要干什么",
+                "default": true
+            }
+        }
+    },    
+    "idle_check_config": {
+        "type": "object",
+        "description": "主动消息设置（统一的空闲检测）",
+        "items": {
+            "check_interval_seconds": {
+                "type": "int",
+                "description": "检查间隔(秒)",
+                "hint": "后台任务每隔多少秒检查一次空闲会话",
+                "default": 200
+            },
+            "idle_trigger_min_minutes": {
+                "type": "int",
+                "description": "最短触发时间(分钟)",
+                "hint": "代码会在最短和最长时间之间随机安排主动消息；模型不能指定时间。",
+                "default": 30
+            },
+            "idle_trigger_max_minutes": {
+                "type": "int",
+                "description": "最长触发时间(分钟)",
+                "hint": "实际触发时间由代码在最短和最长之间随机抽取。",
+                "default": 80
+            },
+            "max_consecutive_messages": {
+                "type": "int",
+                "description": "最大连续追发次数",
+                "hint": "在用户回复之前，最多连续发送主动消息的次数",
+                "default": 3
+            },
+            "trigger_probability": {
+                "type": "int",
+                "description": "触发概率(%)",
+                "hint": "满足空闲时间后实际发送的概率，0-100。设为80表示有80%概率发送，20%概率跳过",
+                "default": 80
+            },
+            "new_topic_probability": {
+                "type": "int",
+                "description": "新话题概率(%)",
+                "hint": "触发时选择开启新话题（而非续聊上下文）的概率，0-100。建议60以上，因为用户不回了通常表示不想继续旧话题",
+                "default": 60
+            },
+            "cleanup_inactive_days": {
+                "type": "int",
+                "description": "自动清理天数",
+                "hint": "超过这个天数没有活动的会话记录将被自动清理，设为0禁用",
+                "default": 10
+            }
+        }
+    },
+    "blacklist_config": {
+        "type": "object",
+        "description": "黑名单设置",
+        "items": {
+            "blacklist_enabled": {
+                "type": "bool",
+                "description": "启用黑名单",
+                "hint": "启用后，黑名单中的用户不会收到主动消息，其他用户正常",
+                "default": false
+            },
+            "blacklist_users": {
+                "type": "list",
+                "description": "黑名单用户ID列表",
+                "hint": "填写QQ号，这些用户不会收到主动消息",
+                "default": []
+            }
+        }
+    },
+    "group_chat_config": {
+        "type": "object",
+        "description": "群聊主动消息设置",
+        "items": {
+            "enable_group_active_message": {
+                "type": "bool",
+                "description": "允许在群聊中发送主动消息",
+                "hint": "关闭后，所有群聊都不会收到主动消息（默认关闭）。开启后群聊也会触发主动消息",
+                "default": false
+            }
+        }
+    },
+    "quiet_hours_config": {
+        "type": "object",
+        "description": "免打扰设置",
+        "items": {
+            "quiet_hours_enabled": {
+                "type": "bool",
+                "description": "使用免打扰时间",
+                "hint": "开启后，在下方固定时段内不会发送主动消息。若角色作息插件正常运行，主动消息会自动服从它的随机睡眠和临时离开状态，此开关可以关闭；未使用作息插件时建议开启作为后备保护。",
+                "default": true
+            },
+            "quiet_hours_start": {
+                "type": "int",
+                "description": "免打扰开始时间 (小时, 0-23)",
+                "hint": "设置为23代表从晚上11点开始",
+                "default": 23
+            },
+            "quiet_hours_end": {
+                "type": "int",
+                "description": "免打扰结束时间 (小时, 0-23)",
+                "hint": "设置为7代表到早上7点结束",
+                "default": 7
+            }
+        }
+    },
+    "logging_config": {
+        "type": "object",
+        "description": "日志与调试开关",
+        "items": {
+            "log_periodic_check": {
+                "type": "bool",
+                "description": "记录定时检查日志",
+                "hint": "是否在控制台打印定时空闲检查日志，建议仅在调试时开启",
+                "default": false
+            },
+            "log_decision_json": {
+                "type": "bool",
+                "description": "记录决策JSON日志",
+                "hint": "是否在控制台打印TA返回的原始决策JSON，建议仅在调试时开启",
+                "default": false
+            }
+        }
+    }
+}

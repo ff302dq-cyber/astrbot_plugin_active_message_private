@@ -1,0 +1,2 @@
+from .main import InitiativeMessagePlugin
+__config_class__ = InitiativeMessagePlugin
