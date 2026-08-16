@@ -1,4 +1,4 @@
-# 在你身边 - 主动消息插件（改造版 v4.1.0）
+# 在你身边 - 主动消息插件（改造版 v4.2.0）
 
 基于 Iris_祈鸢 的原版插件改造。
 
@@ -65,6 +65,9 @@
 
 ## 升级注意
 
+- v4.2.0 修复 AstrBot 4.24 下状态目录被重复拼接的问题；启动时会自动合并旧标准目录、重复嵌套目录和历史仓库名目录中的 `state.json`
+- 保持插件唯一标识 `astrbot_plugin_activemessage` 不变；若旧版本曾以仓库名创建配置文件，会自动导入可对应的旧配置
+- 旧版群聊开关、群聊白名单和定时检查日志开关会自动迁移；旧文件不会被删除
 - 原版的 `whitelist_config` 已改为 `blacklist_config`
 - 原版的 `proactive_initiation_config`（长期主动消息）已并入 `idle_check_config`
 - state.json 中的 `proactive_counters` 字段不再使用（自动忽略，无需手动清理）

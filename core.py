@@ -242,10 +242,17 @@ class ActiveMessageCore:
         """
         # 群聊检查（优先级最高）
         if self._is_group_chat(session_key):
-            group_enabled = self.config.get("group_chat_config", {}).get("enable_group_active_message", False)
+            group_config = self.config.get("group_chat_config", {})
+            group_enabled = group_config.get("enable_group_active_message", False)
             if not group_enabled:
                 logger.debug(f"activemessage: 群聊 {session_key} 被全局开关屏蔽")
                 return True
+            group_whitelist = group_config.get("group_whitelist", [])
+            if group_whitelist:
+                group_id = str(session_key.split(":")[-1])
+                if group_id not in {str(group) for group in group_whitelist}:
+                    logger.debug(f"activemessage: 群聊 {session_key} 不在兼容白名单中")
+                    return True
         
         # 黑名单检查
         blacklist_config = self.config.get("blacklist_config", {})
