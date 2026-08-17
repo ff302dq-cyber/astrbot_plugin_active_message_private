@@ -4,13 +4,23 @@ import re
 import os
 import random
 import difflib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.star import Context, StarTools
 from astrbot.api.all import *
+
+
+BUSINESS_TIMEZONE_NAME = "Asia/Shanghai"
+try:
+    BUSINESS_TIMEZONE = ZoneInfo(BUSINESS_TIMEZONE_NAME)
+except ZoneInfoNotFoundError:
+    # 极简容器可能没有 tzdata；中国当前业务时间固定为 UTC+8。
+    BUSINESS_TIMEZONE = timezone(timedelta(hours=8), BUSINESS_TIMEZONE_NAME)
 
 
 def format_timedelta_human_readable(duration):
@@ -157,6 +167,7 @@ class ActiveMessageCore:
         self.parent = parent_plugin
         self.context = parent_plugin.context
         self.config = parent_plugin.config
+        self.instance_id = uuid4().hex[:8]
 
         # 停止标志：一旦设为True，所有发送操作立即中止
         self._stopped = False
@@ -196,9 +207,16 @@ class ActiveMessageCore:
         logger.info("activemessage: 已从持久化数据中恢复状态")
 
     def start(self):
+        if not self._is_current_instance():
+            logger.warning(
+                f"activemessage[{self.instance_id}]: 当前核心已被新实例替代，拒绝启动后台任务"
+            )
+            return
         if not self.idle_check_task or self.idle_check_task.done():
             self.idle_check_task = asyncio.create_task(self._periodic_check_task())
-            logger.info("activemessage: 已成功启动【统一空闲检测】任务")
+            logger.info(
+                f"activemessage[{self.instance_id}]: 已成功启动【统一空闲检测】任务"
+            )
 
     def stop(self):
         """停止核心服务，清理所有后台任务和延迟任务"""
@@ -223,6 +241,23 @@ class ActiveMessageCore:
         self.scheduled_tasks.clear()
         if cancelled_count > 0:
             logger.info(f"activemessage: 已取消 {cancelled_count} 个延迟任务")
+
+    def _is_current_instance(self) -> bool:
+        """确认本核心仍是进程中登记的当前实例。
+
+        旧插件目录和热重载可能让同一插件以不同模块名加载。父插件使用
+        进程级注册表处理这种情况；测试或旧宿主没有检查器时保持兼容。
+        """
+        checker = getattr(self.parent, "is_current_core", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(checker(self))
+        except Exception as exc:
+            logger.error(
+                f"activemessage[{self.instance_id}]: 检查当前实例失败，禁止主动发送: {exc}"
+            )
+            return False
 
     # ========== 群聊检测 ==========
     def _is_group_chat(self, session_key: str) -> bool:
@@ -278,29 +313,84 @@ class ActiveMessageCore:
             logger.info(f"activemessage: 概率检查未通过 (掷骰={roll}, 需要<={trigger_prob})，本次跳过")
         return passed
 
-    def _is_quiet_hours(self, now: Optional[datetime] = None) -> bool:
+    def _quiet_hours_status(self, now: Optional[datetime] = None) -> dict:
         quiet_config = self.config.get("quiet_hours_config", {}) or {}
         enabled = quiet_config.get(
             "quiet_hours_enabled",
             self.config.get("quiet_hours_enabled", True)
         )
-        if not self._as_bool(enabled, True):
-            return False
+        enabled_parsed = self._as_bool(enabled, True)
 
-        now = now or datetime.now()
-        start_hour = self._parse_hour(
-            quiet_config.get("quiet_hours_start", self.config.get("quiet_hours_start", 23)),
-            23
-        )
-        end_hour = self._parse_hour(
-            quiet_config.get("quiet_hours_end", self.config.get("quiet_hours_end", 7)),
-            7
-        )
-        current_hour = now.hour
+        if now is None:
+            business_now = datetime.now(BUSINESS_TIMEZONE)
+        elif now.tzinfo is None:
+            business_now = now.replace(tzinfo=BUSINESS_TIMEZONE)
+        else:
+            business_now = now.astimezone(BUSINESS_TIMEZONE)
 
-        if start_hour > end_hour:
-            return current_hour >= start_hour or current_hour < end_hour
-        return start_hour <= current_hour < end_hour
+        start_raw = quiet_config.get(
+            "quiet_hours_start", self.config.get("quiet_hours_start", 23)
+        )
+        end_raw = quiet_config.get(
+            "quiet_hours_end", self.config.get("quiet_hours_end", 7)
+        )
+
+        parse_error = None
+        try:
+            start_minute = self._parse_quiet_time(start_raw, 23)
+            end_minute = self._parse_quiet_time(end_raw, 7)
+        except (TypeError, ValueError) as exc:
+            # 免打扰已经开启时，错误配置必须安全拦截，不能悄悄放行。
+            start_minute = None
+            end_minute = None
+            parse_error = str(exc)
+
+        in_quiet_hours = False
+        if enabled_parsed:
+            if parse_error:
+                in_quiet_hours = True
+            else:
+                current_minute = business_now.hour * 60 + business_now.minute
+                if start_minute == end_minute:
+                    in_quiet_hours = True
+                elif start_minute > end_minute:
+                    in_quiet_hours = (
+                        current_minute >= start_minute
+                        or current_minute < end_minute
+                    )
+                else:
+                    in_quiet_hours = start_minute <= current_minute < end_minute
+
+        return {
+            "enabled_raw": enabled,
+            "enabled": enabled_parsed,
+            "start_raw": start_raw,
+            "end_raw": end_raw,
+            "start_minute": start_minute,
+            "end_minute": end_minute,
+            "now": business_now,
+            "timezone": BUSINESS_TIMEZONE_NAME,
+            "parse_error": parse_error,
+            "in_quiet_hours": in_quiet_hours,
+        }
+
+    def _is_quiet_hours(self, now: Optional[datetime] = None) -> bool:
+        return bool(self._quiet_hours_status(now)["in_quiet_hours"])
+
+    def log_quiet_hours_config(self) -> None:
+        status = self._quiet_hours_status()
+        logger.info(
+            f"activemessage[{self.instance_id}]: 固定免打扰配置 "
+            f"enabled={status['enabled']} raw_enabled={status['enabled_raw']!r} "
+            f"start={status['start_raw']!r} end={status['end_raw']!r} "
+            f"now={status['now'].isoformat()} timezone={status['timezone']} "
+            f"config_id={id(self.config)}"
+        )
+        if status["parse_error"]:
+            logger.error(
+                f"activemessage[{self.instance_id}]: 免打扰配置解析失败，将禁止主动发送: "
+                f"{status['parse_error']}"
+            )
 
     @staticmethod
     def _as_bool(value, default: bool) -> bool:
@@ -327,6 +417,30 @@ class ActiveMessageCore:
         except (TypeError, ValueError):
             hour = default
         return max(0, min(23, hour))
+
+    @staticmethod
+    def _parse_quiet_time(value, default_hour: int) -> int:
+        """把整数小时或 HH:MM 转成当天分钟数。"""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return default_hour * 60
+        if isinstance(value, bool):
+            raise ValueError(f"时间值不能是布尔值: {value!r}")
+        if isinstance(value, str):
+            raw = value.strip()
+            if ":" in raw:
+                parts = raw.split(":")
+                if len(parts) != 2:
+                    raise ValueError(f"无法解析时间: {value!r}")
+                hour, minute = (int(part.strip()) for part in parts)
+            else:
+                hour, minute = int(raw), 0
+        elif isinstance(value, (int, float)) and int(value) == value:
+            hour, minute = int(value), 0
+        else:
+            raise ValueError(f"无法解析时间: {value!r}")
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError(f"时间超出范围: {value!r}")
+        return hour * 60 + minute
 
     def _max_consecutive_messages(self) -> int:
         return self.config.get("idle_check_config", {}).get("max_consecutive_messages", 3)
@@ -436,7 +550,32 @@ class ActiveMessageCore:
             logger.info(f"{log_prefix}: 插件已停止，跳过主动发送")
             return False
 
+        if not self._is_current_instance():
+            logger.warning(
+                f"{log_prefix}: 核心实例 {self.instance_id} 已失效，跳过主动发送"
+            )
+            self.stop()
+            return False
+
         if self._is_blocked(session_key):
+            return False
+
+        # 固定免打扰是独立硬闸门，优先于作息插件和任何异步查询。
+        quiet_status = self._quiet_hours_status()
+        if quiet_status["in_quiet_hours"]:
+            if quiet_status["parse_error"]:
+                logger.error(
+                    f"{log_prefix}: 免打扰配置无效，安全禁止主动发送 "
+                    f"instance={self.instance_id} error={quiet_status['parse_error']} "
+                    f"start={quiet_status['start_raw']!r} end={quiet_status['end_raw']!r}"
+                )
+            else:
+                logger.info(
+                    f"{log_prefix}: 当前处于固定免打扰时间，跳过主动发送 {session_key} "
+                    f"instance={self.instance_id} now={quiet_status['now'].isoformat()} "
+                    f"start={quiet_status['start_raw']!r} end={quiet_status['end_raw']!r}"
+                )
+            self._reset_idle_timer(session_key)
             return False
 
         resolved_bot_id = bot_id or self.session_bot_ids.get(session_key)
@@ -445,9 +584,11 @@ class ActiveMessageCore:
         ):
             return False
 
-        if self._is_quiet_hours():
-            logger.info(f"{log_prefix}: 当前处于免打扰时间，跳过主动发送 {session_key}")
-            self._reset_idle_timer(session_key)
+        if not self._is_current_instance():
+            logger.warning(
+                f"{log_prefix}: 作息查询期间实例 {self.instance_id} 已被替换，跳过主动发送"
+            )
+            self.stop()
             return False
 
         max_consecutive = self._max_consecutive_messages()

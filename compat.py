@@ -137,8 +137,10 @@ def _copy_if_default(
     defaults: MutableMapping[str, Any],
     *,
     prefer_source: bool,
+    preserve_existing_paths: set[str] | None = None,
 ) -> list[str]:
     changed: list[str] = []
+    preserve_existing_paths = preserve_existing_paths or set()
     for key, default in defaults.items():
         if key not in source:
             continue
@@ -150,12 +152,15 @@ def _copy_if_default(
             for child_key, child_default in default.items():
                 if child_key not in source_value:
                     continue
+                field_path = f"{key}.{child_key}"
+                if field_path in preserve_existing_paths and child_key in target_value:
+                    continue
                 if (
                     prefer_source
                     or target_value.get(child_key, child_default) == child_default
                 ) and target_value.get(child_key) != source_value[child_key]:
                     target_value[child_key] = deepcopy(source_value[child_key])
-                    changed.append(f"{key}.{child_key}")
+                    changed.append(field_path)
         elif prefer_source or target.get(key, default) == default:
             if target.get(key) != source_value:
                 target[key] = deepcopy(source_value)
@@ -212,6 +217,13 @@ def migrate_plugin_config(
                 source,
                 _CURRENT_DEFAULTS,
                 prefer_source=bool(first_deploy),
+                # 当前面板里的免打扰选择拥有最高优先级。不能因为它恰好
+                # 等于默认值，就被旧别名配置中的关闭状态重新覆盖。
+                preserve_existing_paths={
+                    "quiet_hours_config.quiet_hours_enabled",
+                    "quiet_hours_config.quiet_hours_start",
+                    "quiet_hours_config.quiet_hours_end",
+                },
             )
         )
 

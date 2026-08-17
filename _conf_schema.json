@@ -32,31 +32,31 @@
                 "type": "int",
                 "description": "最短触发时间(分钟)",
                 "hint": "代码会在最短和最长时间之间随机安排主动消息；模型不能指定时间。",
-                "default": 120
+                "default": 30
             },
             "idle_trigger_max_minutes": {
                 "type": "int",
                 "description": "最长触发时间(分钟)",
                 "hint": "实际触发时间由代码在最短和最长之间随机抽取。",
-                "default": 600
+                "default": 80
             },
             "max_consecutive_messages": {
                 "type": "int",
                 "description": "最大连续追发次数",
                 "hint": "在用户回复之前，最多连续发送主动消息的次数",
-                "default": 1
+                "default": 3
             },
             "trigger_probability": {
                 "type": "int",
                 "description": "触发概率(%)",
                 "hint": "满足空闲时间后实际发送的概率，0-100。设为80表示有80%概率发送，20%概率跳过",
-                "default": 60
+                "default": 80
             },
             "new_topic_probability": {
                 "type": "int",
                 "description": "新话题概率(%)",
                 "hint": "触发时选择开启新话题（而非续聊上下文）的概率，0-100。建议60以上，因为用户不回了通常表示不想继续旧话题",
-                "default": 70
+                "default": 60
             },
             "cleanup_inactive_days": {
                 "type": "int",
