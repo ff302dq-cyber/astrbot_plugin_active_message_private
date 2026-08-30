@@ -917,7 +917,7 @@ class ActiveMessageCore:
         except Exception as e:
             logger.warning(f"activemessage: 加载历史记录失败: {e}")
 
-        current_time_str = datetime.now().strftime('%H:%M')
+        current_time_str = datetime.now(BUSINESS_TIMEZONE).strftime('%Y-%m-%d %H:%M（北京时间，UTC+8，24小时制）')
 
         # --- 决定话题策略：续聊 or 新话题 ---
         new_topic_probability = self.config.get("idle_check_config", {}).get("new_topic_probability", 60)
@@ -1160,7 +1160,7 @@ class ActiveMessageCore:
             history_context = await self.context.conversation_manager.get_human_readable_context(
                 unified_msg_origin=event.unified_msg_origin, conversation_id=session_id, page_size=5
             )
-            current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            current_time_str = datetime.now(BUSINESS_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S（北京时间，UTC+8，24小时制）')
             
             existing_tasks_str = "无"
             task_list = []
