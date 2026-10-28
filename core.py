@@ -151,6 +151,50 @@ def check_message_duplicate(new_message: str, history: list, threshold: float = 
     return False, highest_similarity
 
 
+# ===== 话费账本计费（ledger patch）=====
+import sys as _ledger_sys
+
+
+async def _ledger_billed_chat(provider, qq, kind, group_id="", **kwargs):
+    """带计费的 text_chat。话费不足时返回 None，调用方会当作没有生成内容。"""
+    m = _ledger_sys.modules.get("astrbot_ledger")
+    lc = getattr(m, "client", None) if m else None
+    cid = None
+    if lc and qq:
+        model = ""
+        try:
+            model = str(provider.provider_config.get("id") or provider.get_model())
+        except Exception:
+            pass
+        ok, cid, _ = await lc.charge(qq=str(qq), kind=kind, model=model, group_id=str(group_id or ""))
+        if not ok:
+            logger.info(f"activemessage: 用户 {qq} 话费不足，跳过本次{kind}")
+            return None
+    try:
+        resp = await provider.text_chat(**kwargs)
+    except Exception:
+        if cid:
+            await lc.settle(cid, False)
+        raise
+    if cid:
+        await lc.settle(cid, True)
+    return resp
+# ===== ledger patch end =====
+
+
+# ===== 可编辑提示词（默认值，WebUI 里可改）=====
+DEFAULT_NEW_TOPIC_PROMPT = '{人设}\n\n[系统指令：当前状态]\n你和用户上次聊天是在 {上次聊天时间}，到现在大约过了 {沉默时长}（你不能直接说出具体时长）。\n现在的时间是：{当前时间}。这是你第 {第几次} 次主动发消息。\n\n[你的任务：自然地开启一个新话题]\n用户不再回复了，说明上一个话题已经结束。你不应该再纠缠旧话题，而是像一个真实的人一样，自然地想到新的东西来聊。\n\n你可以从以下方向选择一个来开启新话题（任选其一，自然为主）：\n- **时间/环境联想**：根据当前时间（{当前时间}），聊聊你此刻在做什么、看到什么、吃了什么、天气怎么样。比如午后犯困、傍晚散步、夜里睡不着等。\n- **回忆联想**：从[过往回忆片段]里随机挑一段，自然地提起来，"突然想到那次我们聊的那个…"或者"刚才看到一个什么东西让我想起…"。\n- **日常分享**：分享一个小发现、一个想法、一个问题、看到的有趣的东西。\n- **轻松关心**：根据你对用户的了解（从记忆中），关心一下用户最近在忙的事。\n\n[核心规则]\n1. **严禁提及等待时长**：不准说"过了3小时"之类的话。\n2. **严禁纠缠旧话题**：不要试图接着上次的话题说。\n3. **符合当前时间**：说的话必须符合现在的时间，不要说和现在时段不符的话。\n4. **风格一致**：必须使用 {角色名} 的口吻和风格。\n5. **排重**：确保你说的话没有在近期重复过。\n6. **不要过度自责或撒娇**：自然一点，像真人一样随意开口就好。\n\n[参考资料]\n---\n[核心记忆]: {核心记忆}\n---\n[近期日记]: {近期日记}\n---\n[过往回忆片段（可用于联想灵感）]:\n{回忆片段}\n---\n[最近的对话历史（仅供了解上下文，不要续聊这些内容）]:\n{对话历史}\n---\n[指令]: 以 {角色名} 的身份，自然地开启一个全新的话题。输出一句话即可。\n'
+DEFAULT_CONTINUE_PROMPT = '{人设}\n\n[系统指令：当前状态]\n你和用户上次聊天是在 {上次聊天时间}，到现在大约过了 {沉默时长}，之后用户一直没有回复。你仍在此情境中。\n现在的时间是：{当前时间}。这是你第 {第几次} 次主动发消息。\n\n[你的任务]\n1. 顺着[最近的对话历史]的逻辑，或根据你的人设，构思一句用于接续剧情的消息。\n2. 注意时间的变化：如果历史里的内容和当时的时间有关（比如吃午饭、出门、下班），而现在时段已经变了，就按现在的时间说话，不要再说当时的话。\n3. 风格、语气、是否使用旁白等，必须严格遵循 {角色名} 以及在历史中展现的对话风格。\n4. 排重检查：确保核心语义没有在近期重复过。\n5. 如果上下文中用户已经明确说了"晚安""去忙了"等告别语，不要强行续聊，改为一句温暖的等候。\n\n[参考资料]\n---\n[核心记忆]: {核心记忆}\n---\n[近期日记]: {近期日记}\n---\n[最近的对话历史（assistant是你）]:\n{对话历史}\n---\n[指令]: 以 {角色名} 的口吻，输出一句【没有重复过的】、用于【自然接续】的新消息。\n'
+
+
+def render_prompt(template: str, values: dict) -> str:
+    """把 {占位符} 换成实际内容。用户写错占位符也不会报错。"""
+    out = template
+    for k, v in values.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+
 class ActiveMessageCore:
     """主动对话核心类（改造版）
     
@@ -168,6 +212,8 @@ class ActiveMessageCore:
         self.context = parent_plugin.context
         self.config = parent_plugin.config
         self.instance_id = uuid4().hex[:8]
+        self.user_prefs = {}
+        self.load_user_prefs()
 
         # 停止标志：一旦设为True，所有发送操作立即中止
         self._stopped = False
@@ -185,11 +231,40 @@ class ActiveMessageCore:
         # 标记插件自己正在主动发送，避免 after_message_sent 反过来再次安排跟进
         self._proactive_send_markers: dict = {}
         self._send_locks: dict = {}
-        self._schedule_blocked_sessions: set[str] = set()
         self._time_rng = random.SystemRandom()
         
         # 后台任务引用
         self.idle_check_task = None
+
+    # ========== 用户自己的主动消息设置（关闭 / 频率）==========
+    FREQ_FACTORS = {"高": 0.5, "中": 1.0, "低": 2.0}
+
+    def _prefs_path(self):
+        try:
+            d = str(StarTools.get_data_dir("astrbot_plugin_activemessage"))
+        except Exception:
+            d = os.path.dirname(os.path.abspath(__file__))
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "user_prefs.json")
+
+    def load_user_prefs(self):
+        try:
+            with open(self._prefs_path(), encoding="utf-8") as f:
+                self.user_prefs = json.load(f)
+        except Exception:
+            self.user_prefs = {}
+
+    def save_user_prefs(self):
+        try:
+            with open(self._prefs_path(), "w", encoding="utf-8") as f:
+                json.dump(self.user_prefs, f, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"activemessage: 保存用户设置失败: {e}")
+
+    def _user_pref(self, session_key: str) -> dict:
+        if self._is_group_chat(session_key):
+            return {}
+        return getattr(self, "user_prefs", {}).get(str(session_key).split(":")[-1], {})
 
     def get_data(self) -> dict:
         return {
@@ -459,16 +534,19 @@ class ActiveMessageCore:
             minimum = maximum
         return minimum * 60, maximum * 60
 
-    def _random_delay_seconds(self) -> int:
+    def _random_delay_seconds(self, session_key: str | None = None) -> int:
         minimum, maximum = self._delay_bounds_seconds()
-        return self._time_rng.randint(minimum, maximum)
+        factor = 1.0
+        if session_key:
+            factor = self.FREQ_FACTORS.get(self._user_pref(session_key).get("freq", "中"), 1.0)
+        return int(self._time_rng.randint(minimum, maximum) * factor)
 
     def _reset_idle_timer(self, session_key: str) -> None:
         record = self.user_records.get(session_key)
         if not record:
             return
         record["timestamp"] = datetime.now().isoformat()
-        record["trigger_seconds"] = self._random_delay_seconds()
+        record["trigger_seconds"] = self._random_delay_seconds(session_key)
 
     def _has_pending_followup(self, session_key: str) -> bool:
         followups = self.scheduled_tasks.get(session_key, {}).get("followups", [])
@@ -476,58 +554,6 @@ class ActiveMessageCore:
             task_info.get("task") and not task_info["task"].done()
             for task_info in followups
         )
-
-    async def _schedule_allows_proactive(
-        self, session_key: str, bot_id: str | None
-    ) -> bool:
-        try:
-            from astrbot_plugin_tiangan_schedule.availability import (
-                query_schedule_availability,
-            )
-        except ImportError:
-            if session_key in self._schedule_blocked_sessions:
-                self._schedule_blocked_sessions.discard(session_key)
-                self._reset_idle_timer(session_key)
-                return False
-            return True
-
-        try:
-            availability = await query_schedule_availability(bot_id or None)
-        except Exception as exc:
-            logger.error(
-                f"activemessage: 查询作息状态失败，本次禁止主动发送: {exc}"
-            )
-            self._schedule_blocked_sessions.add(session_key)
-            self._reset_idle_timer(session_key)
-            return False
-        if availability is None:
-            if session_key in self._schedule_blocked_sessions:
-                self._schedule_blocked_sessions.discard(session_key)
-                self._reset_idle_timer(session_key)
-                return False
-            return True
-        if availability.can_send_proactive:
-            if session_key in self._schedule_blocked_sessions:
-                self._schedule_blocked_sessions.discard(session_key)
-                self._reset_idle_timer(session_key)
-                logger.info(
-                    f"activemessage: {session_key} 已恢复在线，重新随机等待时间"
-                )
-                return False
-            return True
-
-        next_online = (
-            availability.next_online_at.isoformat()
-            if availability.next_online_at
-            else "未知"
-        )
-        logger.info(
-            "activemessage: 作息插件阻止主动发送 "
-            f"{session_key} state={availability.state} next_online={next_online}"
-        )
-        self._schedule_blocked_sessions.add(session_key)
-        self._reset_idle_timer(session_key)
-        return False
 
     def _get_proactive_count(self, session_key: str) -> int:
         return self.idle_counters.get(session_key, {}).get("count", 0)
@@ -576,19 +602,6 @@ class ActiveMessageCore:
                     f"start={quiet_status['start_raw']!r} end={quiet_status['end_raw']!r}"
                 )
             self._reset_idle_timer(session_key)
-            return False
-
-        resolved_bot_id = bot_id or self.session_bot_ids.get(session_key)
-        if not await self._schedule_allows_proactive(
-            session_key, resolved_bot_id
-        ):
-            return False
-
-        if not self._is_current_instance():
-            logger.warning(
-                f"{log_prefix}: 作息查询期间实例 {self.instance_id} 已被替换，跳过主动发送"
-            )
-            self.stop()
             return False
 
         max_consecutive = self._max_consecutive_messages()
@@ -731,6 +744,10 @@ class ActiveMessageCore:
                         if self._is_blocked(session_key):
                             continue
 
+                        # 用户自己关闭了主动消息
+                        if self._user_pref(session_key).get("off"):
+                            continue
+
                         # 会话是否已切换
                         recorded_conv_id = record.get("conversation_id")
                         try:
@@ -779,7 +796,7 @@ class ActiveMessageCore:
                             # 重新随机一个等待时间
                             self.user_records[session_key][
                                 "trigger_seconds"
-                            ] = self._random_delay_seconds()
+                            ] = self._random_delay_seconds(session_key)
                             continue
 
                         # === 所有检查通过，触发主动消息 ===
@@ -827,6 +844,9 @@ class ActiveMessageCore:
         bot_id: str | None = None,
     ):
         """触发一次主动消息。根据概率选择【续聊上下文】或【开启新话题】。"""
+        if self._user_pref(session_key).get("off"):
+            logger.info(f"activemessage: {session_key} 已自行关闭主动消息，跳过")
+            return False
         if not await self._can_send_proactive(
             session_key, bot_id=bot_id
         ):
@@ -835,12 +855,20 @@ class ActiveMessageCore:
 
         # --- 计算沉默时长 ---
         human_readable_silence = "一会儿"
+        last_chat_str = "不久前"
+        silence_hours = 0.0
         try:
             user_record = self.user_records.get(session_key)
-            if user_record and user_record.get("timestamp"):
-                last_dt = datetime.fromisoformat(user_record["timestamp"])
+            last_raw = user_record and (user_record.get("last_chat_at") or user_record.get("timestamp"))
+            if last_raw:
+                last_dt = datetime.fromisoformat(last_raw)
                 silence_td = datetime.now() - last_dt
+                silence_hours = silence_td.total_seconds() / 3600
                 human_readable_silence = format_timedelta_human_readable(silence_td)
+                try:
+                    last_chat_str = last_dt.astimezone(BUSINESS_TIMEZONE).strftime("%m月%d日 %H:%M")
+                except Exception:
+                    last_chat_str = last_dt.strftime("%m月%d日 %H:%M")
         except Exception as e:
             logger.warning(f"activemessage: 计算沉默时长出错: {e}")
 
@@ -923,73 +951,36 @@ class ActiveMessageCore:
         new_topic_probability = self.config.get("idle_check_config", {}).get("new_topic_probability", 60)
         new_topic_probability = max(0, min(100, new_topic_probability))
         use_new_topic = random.randint(1, 100) <= new_topic_probability
+        prompt_cfg = self.config.get("topic_prompt_config", {}) or {}
+        if not use_new_topic and prompt_cfg.get("stale_switch_enabled", True):
+            try:
+                stale_hours = float(prompt_cfg.get("stale_switch_hours", 3))
+            except (TypeError, ValueError):
+                stale_hours = 3.0
+            if silence_hours >= stale_hours:
+                use_new_topic = True
+                logger.info(f"activemessage: 距上次聊天 {silence_hours:.1f} 小时，超过 {stale_hours} 小时，改为开启新话题")
         
         strategy_label = "新话题" if use_new_topic else "续聊上下文"
         logger.info(f"activemessage: 话题策略 → {strategy_label} (新话题概率={new_topic_probability}%)")
 
+        prompt_values = {
+            "人设": persona_content,
+            "角色名": role_name,
+            "当前时间": current_time_str,
+            "上次聊天时间": last_chat_str,
+            "沉默时长": human_readable_silence,
+            "第几次": attempt_number,
+            "核心记忆": core_memory_content,
+            "近期日记": recent_diaries_text,
+            "回忆片段": historical_topics if historical_topics else "（暂无）",
+            "对话历史": human_readable_history,
+        }
         if use_new_topic:
-            # ===== 新话题模式 =====
-            idle_message_prompt = f"""{persona_content}
-
-[系统指令：当前状态]
-你和用户的对话已经暂停了一段时间（客观时长约{human_readable_silence}，但你不能直接说出具体时长）。
-现在的时间是：{current_time_str}。这是你第 {attempt_number} 次主动发消息。
-
-[你的任务：自然地开启一个新话题]
-用户不再回复了，说明上一个话题已经结束。你不应该再纠缠旧话题，而是像一个真实的人一样，自然地想到新的东西来聊。
-
-你可以从以下方向选择一个来开启新话题（任选其一，自然为主）：
-- **时间/环境联想**：根据当前时间({current_time_str})，聊聊你此刻在做什么、看到什么、吃了什么、天气怎么样。比如午后犯困、傍晚散步、夜里睡不着等。
-- **回忆联想**：从[过往回忆片段]里随机挑一段，自然地提起来，"突然想到那次我们聊的那个…"或者"刚才看到一个什么东西让我想起…"。
-- **日常分享**：分享一个小发现、一个想法、一个问题、看到的有趣的东西。
-- **轻松关心**：根据你对用户的了解（从记忆中），关心一下用户最近在忙的事。
-
-[核心规则]
-1. **严禁提及等待时长**：不准说"过了3小时"之类的话。
-2. **严禁纠缠旧话题**：不要试图接着上次的话题说。
-3. **风格一致**：必须使用 {role_name} 的口吻和风格。
-4. **排重**：确保你说的话没有在近期重复过。
-5. **不要过度自责或撒娇**：自然一点，像真人一样随意开口就好。
-
-[参考资料]
----
-[核心记忆]: {core_memory_content}
----
-[近期日记]: {recent_diaries_text}
----
-[过往回忆片段（可用于联想灵感）]:
-{historical_topics if historical_topics else "（暂无）"}
----
-[最近的对话历史（仅供了解上下文，不要续聊这些内容）]:
-{human_readable_history}
----
-[指令]: 以 {role_name} 的身份，自然地开启一个全新的话题。输出一句话即可。
-"""
+            template = (prompt_cfg.get("new_topic_prompt") or "").strip() or DEFAULT_NEW_TOPIC_PROMPT
         else:
-            # ===== 续聊上下文模式 =====
-            idle_message_prompt = f"""{persona_content}
-
-[系统指令：当前状态]
-你发出上一条消息后，对话暂时停顿，用户没有回复。你仍在此情境中。
-现在的时间是：{current_time_str}。这是你第 {attempt_number} 次主动发消息。
-
-[你的任务]
-1. 顺着[最近的对话历史]的逻辑，或根据你的人设，构思一句用于接续剧情的消息。
-2. 风格、语气、是否使用旁白等，必须严格遵循 {role_name} 以及在历史中展现的对话风格。
-3. 排重检查：确保核心语义没有在近期重复过。
-4. 如果上下文中用户已经明确说了"晚安""去忙了"等告别语，不要强行续聊，改为一句温暖的等候。
-
-[参考资料]
----
-[核心记忆]: {core_memory_content}
----
-[近期日记]: {recent_diaries_text}
----
-[最近的对话历史（assistant是你）]:
-{human_readable_history}
----
-[指令]: 以 {role_name} 的口吻，输出一句【没有重复过的】、用于【自然接续】的新消息。
-"""
+            template = (prompt_cfg.get("continue_prompt") or "").strip() or DEFAULT_CONTINUE_PROMPT
+        idle_message_prompt = render_prompt(template, prompt_values)
 
         # --- 调用LLM生成 ---
         decision_provider_id = self.config.get("decision_provider_id")
@@ -1001,7 +992,11 @@ class ActiveMessageCore:
         current_prompt = idle_message_prompt
         
         for retry_count in range(max_retries + 1):
-            response = await provider.text_chat(
+            _l_is_group = "group" in session_key.split(":")[1].lower() if session_key.count(":") >= 2 else False
+            response = await _ledger_billed_chat(  # ledger patch
+                provider,
+                None if _l_is_group else session_key.split(":")[-1],
+                "proactive",
                 prompt="（系统指令：请根据System Prompt中的角色和情景，生成一句自然的消息。）",
                 system_prompt=current_prompt,
                 contexts=[]
@@ -1097,10 +1092,11 @@ class ActiveMessageCore:
                 conversation_id = await self.context.conversation_manager.get_curr_conversation_id(session_key)
                 
                 # 更新空闲计时器
-                random_timeout = self._random_delay_seconds()
+                random_timeout = self._random_delay_seconds(session_key)
                 
                 self.user_records[session_key] = {
                     "timestamp": datetime.now().isoformat(),
+                    "last_chat_at": datetime.now().isoformat(),  # 只在用户发消息时更新
                     "conversation_id": conversation_id,
                     "trigger_seconds": random_timeout,
                     "bot_id": bot_id,
@@ -1119,6 +1115,9 @@ class ActiveMessageCore:
         # --- "活着的Ta"决策功能 ---
         decision_config = self.config.get("decision_making_config", {})
         if not decision_config.get("enable_decision_making", True):
+            return
+        # 用户自己关闭了回复追发：不调用决策，也不花这次的钱
+        if self._user_pref(session_key).get("followup_off"):
             return
                 
         result = event.get_result()
@@ -1240,7 +1239,9 @@ class ActiveMessageCore:
 """
             
             provider = self.context.get_provider_by_id(self.config.get("decision_provider_id")) or self.context.get_using_provider()
-            response = await provider.text_chat(prompt="请进行决策。", system_prompt=decision_prompt, contexts=[])
+            response = await _ledger_billed_chat(  # ledger patch
+                provider, event.get_sender_id(), "decision", event.get_group_id() or "",
+                prompt="请进行决策。", system_prompt=decision_prompt, contexts=[])
             raw_response_text = response.completion_text if response else ""
             json_match = re.search(r'\{.*\}', raw_response_text, re.DOTALL)
             if not json_match:
@@ -1273,7 +1274,8 @@ class ActiveMessageCore:
             # --- 处理新任务创建 ---
             action = decision.get("action")
             message = decision.get("message")
-            delay = self._random_delay_seconds()
+            delay = self._random_delay_seconds(session_key)
+            created_at = datetime.now()
 
             if action in ["delayed_reminder", "delayed_followup"] and message:
                 if action == "delayed_followup":
@@ -1289,6 +1291,18 @@ class ActiveMessageCore:
                         if self._stopped:
                             logger.info(f"activemessage: 延迟任务 {task_id} 检测到停止标志，放弃发送")
                             return
+
+                        # 追发保质期：提前写好的话放太久就不发了
+                        fcfg = self.config.get("followup_config", {}) or {}
+                        if fcfg.get("followup_expire_enabled", True):
+                            try:
+                                expire_sec = float(fcfg.get("followup_expire_minutes", 90)) * 60
+                            except (TypeError, ValueError):
+                                expire_sec = 90 * 60
+                            age = (datetime.now() - created_at).total_seconds()
+                            if age > expire_sec:
+                                logger.info(f"activemessage: 延迟任务 {task_id} 已放了 {age/60:.0f} 分钟，超过保质期，丢弃")
+                                return
 
                         async with self._get_send_lock(current_session_key):
                             if not await self._can_send_proactive(

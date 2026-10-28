@@ -172,6 +172,59 @@ class InitiativeMessagePlugin(Star):
         if hasattr(self, 'core'):
             await self.core.decide_initiative_action(event, *args, **kwargs)
 
+    # ========== 用户自助设置（ledger patch 一起加的）==========
+    @filter.command("关闭主动消息")
+    async def user_disable_active(self, event: AstrMessageEvent):
+        """关闭这个角色空闲时主动找你"""
+        uid = str(event.get_sender_id())
+        self.core.user_prefs.setdefault(uid, {})["off"] = True
+        self.core.save_user_prefs()
+        yield event.plain_result("【系统提示】已关闭主动消息，之后空闲时我不会主动找你了。回复后追发是另一个开关，发送“关闭回复追发”可以一起关掉。")
+
+    @filter.command("开启主动消息")
+    async def user_enable_active(self, event: AstrMessageEvent):
+        """重新开启主动消息"""
+        uid = str(event.get_sender_id())
+        self.core.user_prefs.setdefault(uid, {})["off"] = False
+        self.core.save_user_prefs()
+        yield event.plain_result("【系统提示】已开启主动消息。发送“主动消息频率 高/中/低”可以调整频率。")
+
+    @filter.command("关闭回复追发")
+    async def user_disable_followup(self, event: AstrMessageEvent):
+        """关闭回复后决策和追发"""
+        uid = str(event.get_sender_id())
+        self.core.user_prefs.setdefault(uid, {})["followup_off"] = True
+        self.core.save_user_prefs()
+        if not event.get_group_id():
+            try:
+                self.core._cancel_pending_followups(event.unified_msg_origin, "用户关闭回复追发")
+            except Exception:
+                pass
+        yield event.plain_result("【系统提示】已关闭回复追发，我回复你之后不会再过一会儿追一句了，私聊每条消息也只算一次话费。")
+
+    @filter.command("开启回复追发")
+    async def user_enable_followup(self, event: AstrMessageEvent):
+        """重新开启回复后决策和追发"""
+        uid = str(event.get_sender_id())
+        self.core.user_prefs.setdefault(uid, {})["followup_off"] = False
+        self.core.save_user_prefs()
+        yield event.plain_result("【系统提示】已开启回复追发。")
+
+    @filter.command("主动消息频率")
+    async def user_set_active_freq(self, event: AstrMessageEvent, level: str = ""):
+        """调整主动消息频率：高 / 中 / 低"""
+        level = (level or "").strip()
+        if level not in self.core.FREQ_FACTORS:
+            uid = str(event.get_sender_id())
+            cur = self.core.user_prefs.get(uid, {}).get("freq", "中")
+            yield event.plain_result(f"【系统提示】当前频率：{cur}。发送“主动消息频率 高”、“主动消息频率 中”或“主动消息频率 低”来调整。")
+            return
+        uid = str(event.get_sender_id())
+        self.core.user_prefs.setdefault(uid, {})["freq"] = level
+        self.core.save_user_prefs()
+        tip = {"高": "等待时间减半，会更常来找你", "中": "恢复默认频率", "低": "等待时间翻倍，会少打扰你一些"}[level]
+        yield event.plain_result(f"【系统提示】主动消息频率已调成“{level}”：{tip}。下次你发消息后生效。")
+
     @filter.command("主动消息")
     async def test_initiative_message(self, event: AstrMessageEvent):
         """手动触发主动消息测试"""
