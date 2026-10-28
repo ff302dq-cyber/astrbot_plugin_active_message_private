@@ -45,6 +45,15 @@ def _release_process_core(core: ActiveMessageCore) -> None:
         registry.pop("active_core", None)
 
 
+
+def _sys_reply(event, text):
+    """系统类回复用话费小账本的折叠转发发出，和角色说话区分开"""
+    import sys as _s
+    m = _s.modules.get("astrbot_ledger")
+    fr = getattr(m, "forward_result", None) if m else None
+    return fr(event, text) if fr else event.plain_result(text)
+
+
 class InitiativeMessagePlugin(Star):
     """
     主动消息插件（改造版）
@@ -179,7 +188,7 @@ class InitiativeMessagePlugin(Star):
         uid = str(event.get_sender_id())
         self.core.user_prefs.setdefault(uid, {})["off"] = True
         self.core.save_user_prefs()
-        yield event.plain_result("【系统提示】已关闭主动消息，之后空闲时我不会主动找你了。回复后追发是另一个开关，发送“关闭回复追发”可以一起关掉。")
+        yield _sys_reply(event, "【系统提示】已关闭主动消息，之后空闲时我不会主动找你了。回复后追发是另一个开关，发送“关闭回复追发”可以一起关掉。")
 
     @filter.command("开启主动消息")
     async def user_enable_active(self, event: AstrMessageEvent):
@@ -187,7 +196,7 @@ class InitiativeMessagePlugin(Star):
         uid = str(event.get_sender_id())
         self.core.user_prefs.setdefault(uid, {})["off"] = False
         self.core.save_user_prefs()
-        yield event.plain_result("【系统提示】已开启主动消息。发送“主动消息频率 高/中/低”可以调整频率。")
+        yield _sys_reply(event, "【系统提示】已开启主动消息。发送“主动消息频率 高/中/低”可以调整频率。")
 
     @filter.command("关闭回复追发")
     async def user_disable_followup(self, event: AstrMessageEvent):
@@ -200,7 +209,7 @@ class InitiativeMessagePlugin(Star):
                 self.core._cancel_pending_followups(event.unified_msg_origin, "用户关闭回复追发")
             except Exception:
                 pass
-        yield event.plain_result("【系统提示】已关闭回复追发，我回复你之后不会再过一会儿追一句了，私聊每条消息也只算一次话费。")
+        yield _sys_reply(event, "【系统提示】已关闭回复追发，我回复你之后不会再过一会儿追一句了，私聊每条消息也只算一次话费。")
 
     @filter.command("开启回复追发")
     async def user_enable_followup(self, event: AstrMessageEvent):
@@ -208,7 +217,7 @@ class InitiativeMessagePlugin(Star):
         uid = str(event.get_sender_id())
         self.core.user_prefs.setdefault(uid, {})["followup_off"] = False
         self.core.save_user_prefs()
-        yield event.plain_result("【系统提示】已开启回复追发。")
+        yield _sys_reply(event, "【系统提示】已开启回复追发。")
 
     @filter.command("主动消息频率")
     async def user_set_active_freq(self, event: AstrMessageEvent, level: str = ""):
@@ -217,13 +226,13 @@ class InitiativeMessagePlugin(Star):
         if level not in self.core.FREQ_FACTORS:
             uid = str(event.get_sender_id())
             cur = self.core.user_prefs.get(uid, {}).get("freq", "中")
-            yield event.plain_result(f"【系统提示】当前频率：{cur}。发送“主动消息频率 高”、“主动消息频率 中”或“主动消息频率 低”来调整。")
+            yield _sys_reply(event, f"【系统提示】当前频率：{cur}。发送“主动消息频率 高”、“主动消息频率 中”或“主动消息频率 低”来调整。")
             return
         uid = str(event.get_sender_id())
         self.core.user_prefs.setdefault(uid, {})["freq"] = level
         self.core.save_user_prefs()
         tip = {"高": "等待时间减半，会更常来找你", "中": "恢复默认频率", "低": "等待时间翻倍，会少打扰你一些"}[level]
-        yield event.plain_result(f"【系统提示】主动消息频率已调成“{level}”：{tip}。下次你发消息后生效。")
+        yield _sys_reply(event, f"【系统提示】主动消息频率已调成“{level}”：{tip}。下次你发消息后生效。")
 
     @filter.command("主动消息")
     async def test_initiative_message(self, event: AstrMessageEvent):
