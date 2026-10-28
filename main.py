@@ -1,268 +1,260 @@
-import asyncio
-import builtins
-import json
-from pathlib import Path
+import os
+import re
+import sys
+import time
+import types
 
+import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, StarTools
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.api.star import Context, Star, StarTools, register
 
-from .compat import PLUGIN_ID, load_compatible_state, migrate_plugin_config
-from .core import ActiveMessageCore
+from .ledger_client import LedgerClient
 
-
-_PROCESS_REGISTRY_NAME = "_astrbot_activemessage_process_registry_v1"
-
-
-def _get_process_registry() -> dict:
-    """取得跨模块共享的进程级注册表。
-
-    注册表挂在 builtins 上，因此同一插件从旧目录和新目录分别导入时仍会
-    共享同一份状态。
-    """
-    registry = getattr(builtins, _PROCESS_REGISTRY_NAME, None)
-    if not isinstance(registry, dict):
-        registry = {}
-        setattr(builtins, _PROCESS_REGISTRY_NAME, registry)
-    return registry
+FORWARD_NAME = "话费小账本"
 
 
-def _claim_process_core(core: ActiveMessageCore) -> ActiveMessageCore | None:
-    registry = _get_process_registry()
-    previous = registry.get("active_core")
-    if previous is not None and previous is not core:
-        try:
-            previous.stop()
-        except Exception as exc:
-            logger.error(f"主动消息插件：停止进程中的旧核心失败: {exc}", exc_info=True)
-    registry["active_core"] = core
-    return previous
+def debt_notice(role, debt_usd):
+    who = role or "角色"
+    return (f"【系统消息】{who}和你通讯的手机欠费啦……\n"
+            f"你目前欠了 ￥{debt_usd:.3f} 话费，已经到了欠费上限，暂时收不到{who}的回复了。\n"
+            f"私聊任意一位角色发送 bill，打开链接就能充值。充值时会先扣掉欠费，剩下的继续使用。")
 
 
-def _release_process_core(core: ActiveMessageCore) -> None:
-    registry = _get_process_registry()
-    if registry.get("active_core") is core:
-        registry.pop("active_core", None)
-
-
-
-def _sys_reply(event, text):
-    """系统类回复用话费小账本的折叠转发发出，和角色说话区分开"""
-    import sys as _s
-    m = _s.modules.get("astrbot_ledger")
-    fr = getattr(m, "forward_result", None) if m else None
-    return fr(event, text) if fr else event.plain_result(text)
-
-
-class InitiativeMessagePlugin(Star):
-    """
-    主动消息插件（改造版）
-    改造点：白名单→黑名单、合并短期/长期、概率触发、话题策略、修复追发bug
-    """
-    _active_core: ActiveMessageCore | None = None
-
+@register("astrbot_plugin_ledger", "firejunjun", "话费账本计费", "1.0.0")
+class LedgerPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.data_file = None
-
-        migrated_fields, imported_config_paths = migrate_plugin_config(self.config)
-        if imported_config_paths:
-            logger.info(
-                "主动消息插件：已检查旧配置文件: %s",
-                ", ".join(str(path) for path in imported_config_paths),
-            )
-        if migrated_fields:
-            logger.info(
-                "主动消息插件：已迁移旧配置字段: %s",
-                ", ".join(migrated_fields),
-            )
-
-        # 清理同模块内的旧核心实例。
-        if InitiativeMessagePlugin._active_core is not None:
-            logger.info("主动消息插件：检测到旧的核心实例，正在清理...")
-            InitiativeMessagePlugin._active_core.stop()
-            InitiativeMessagePlugin._active_core = None
-
-        self.core = ActiveMessageCore(self)
-        previous = _claim_process_core(self.core)
-        if previous is not None and previous is not self.core:
-            logger.warning(
-                "主动消息插件：检测到进程级旧核心并已停止；这通常来自热重载或重复插件目录 "
-                f"old_instance={getattr(previous, 'instance_id', 'unknown')} "
-                f"new_instance={self.core.instance_id} module={__name__} file={__file__}"
-            )
-        InitiativeMessagePlugin._active_core = self.core
-        logger.info(
-            "主动消息插件：核心已创建，开始后台初始化 "
-            f"instance={self.core.instance_id} module={__name__} file={__file__} "
-            f"context_id={id(context)} config_id={id(config)}"
+        try:
+            data_dir = str(StarTools.get_data_dir("astrbot_plugin_ledger"))
+        except Exception:
+            data_dir = os.path.dirname(os.path.abspath(__file__))
+        os.makedirs(data_dir, exist_ok=True)
+        exempt = [q.strip() for q in str(config.get("exempt_qq", "")).split(",") if q.strip()]
+        self.client = LedgerClient(
+            url=config.get("ledger_url", ""),
+            secret=config.get("secret", ""),
+            bot_name=config.get("bot_name", ""),
+            offline_allowance=config.get("offline_allowance", 5),
+            queue_path=os.path.join(data_dir, "offline_queue.json"),
+            exempt=exempt,
         )
-        
-        asyncio.create_task(self._initialize_plugin())
+        # 让记忆插件、主动消息插件也能找到同一个账本客户端
+        sys.modules["astrbot_ledger"] = types.SimpleNamespace(
+            client=self.client, notify=self._notify_insufficient,
+            forward_result=self.forward_result, send_forward=self.send_forward)
+        self.client.start()
+        self._last_notice = {}
+        logger.info(f"[账本] 已启动，角色={self.client.bot or '未命名'}，账本={self.client.url}")
 
-    async def _initialize_plugin(self):
+    # ---------- 工具 ----------
+    def _model_name(self, event):
         try:
-            # AstrBot 4.24 的 get_data_dir(name) 已返回插件专属目录，
-            # 不能再拼一次插件名。
-            plugin_data_dir = Path(StarTools.get_data_dir(PLUGIN_ID))
-            plugin_data_dir.mkdir(parents=True, exist_ok=True)
-            self.data_file = str(plugin_data_dir / "state.json")
-            logger.info(f"主动消息插件状态文件: {self.data_file}")
-
-            if not self.is_current_core(self.core):
-                logger.warning(
-                    f"主动消息插件：实例 {self.core.instance_id} 在加载状态前已被替换，停止初始化"
-                )
-                self.core.stop()
-                return
-            self._load_data()
-            if not self.is_current_core(self.core):
-                logger.warning(
-                    f"主动消息插件：初始化期间实例 {self.core.instance_id} 已被替换，停止启动"
-                )
-                self.core.stop()
-                return
-            self.core.log_quiet_hours_config()
-            self.core.start()
-            logger.info("主动消息插件：初始化完成。")
-        except Exception as e:
-            logger.error(f"主动消息插件初始化失败: {e}", exc_info=True)
-
-    async def on_stop(self):
-        logger.info("主动消息插件：正在卸载...")
-        was_current = self.is_current_core(self.core)
-        if hasattr(self, 'core'):
-            self.core.stop()
-        if InitiativeMessagePlugin._active_core is self.core:
-            InitiativeMessagePlugin._active_core = None
-        _release_process_core(self.core)
-        if was_current:
-            self._save_data()
-        else:
-            logger.info(
-                f"主动消息插件：实例 {self.core.instance_id} 已被替换，跳过旧状态回写"
-            )
-        logger.info("主动消息插件：清理完成。")
-
-    def is_current_core(self, core: ActiveMessageCore) -> bool:
-        return _get_process_registry().get("active_core") is core
-
-    def _load_data(self):
-        if self.data_file:
+            p = self.context.get_using_provider(umo=event.unified_msg_origin)
+        except TypeError:
+            p = self.context.get_using_provider()
+        except Exception:
+            p = None
+        if not p:
+            return ""
+        for getter in (lambda: p.provider_config.get("id"), lambda: p.get_model()):
             try:
-                data, source_paths = load_compatible_state(Path(self.data_file))
-                if not source_paths:
-                    return
-                self.core.set_data(data)
-                logger.info(
-                    "主动消息插件：已加载并合并 %d 份历史状态: %s",
-                    len(source_paths),
-                    ", ".join(str(path) for path in source_paths),
-                )
-                # 统一回写到 AstrBot 4.24 的标准位置，旧文件保留作安全备份。
-                self._save_data()
-            except Exception as e:
-                logger.error(f"主动消息插件：加载数据失败: {e}", exc_info=True)
-
-    def _save_data(self):
-        if not self.data_file:
-            return
-        try:
-            data = self.core.get_data()
-            with open(self.data_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-            logger.info("主动消息插件：数据已保存。")
-        except Exception as e:
-            logger.error(f"主动消息插件：保存数据失败: {e}", exc_info=True)
-
-    @filter.after_message_sent(priority=1)
-    async def decide_initiative_action(self, event: AstrMessageEvent, *args, **kwargs):
-        if hasattr(self, 'core'):
-            await self.core.decide_initiative_action(event, *args, **kwargs)
-
-    # ========== 用户自助设置（ledger patch 一起加的）==========
-    @filter.command("关闭主动消息")
-    async def user_disable_active(self, event: AstrMessageEvent):
-        """关闭这个角色空闲时主动找你"""
-        uid = str(event.get_sender_id())
-        self.core.user_prefs.setdefault(uid, {})["off"] = True
-        self.core.save_user_prefs()
-        yield _sys_reply(event, "【系统提示】已关闭主动消息，之后空闲时我不会主动找你了。回复后追发是另一个开关，发送“关闭回复追发”可以一起关掉。")
-
-    @filter.command("开启主动消息")
-    async def user_enable_active(self, event: AstrMessageEvent):
-        """重新开启主动消息"""
-        uid = str(event.get_sender_id())
-        self.core.user_prefs.setdefault(uid, {})["off"] = False
-        self.core.save_user_prefs()
-        yield _sys_reply(event, "【系统提示】已开启主动消息。发送“主动消息频率 高/中/低”可以调整频率。")
-
-    @filter.command("关闭回复追发")
-    async def user_disable_followup(self, event: AstrMessageEvent):
-        """关闭回复后决策和追发"""
-        uid = str(event.get_sender_id())
-        self.core.user_prefs.setdefault(uid, {})["followup_off"] = True
-        self.core.save_user_prefs()
-        if not event.get_group_id():
-            try:
-                self.core._cancel_pending_followups(event.unified_msg_origin, "用户关闭回复追发")
+                v = getter()
+                if v:
+                    return str(v)
             except Exception:
                 pass
-        yield _sys_reply(event, "【系统提示】已关闭回复追发，我回复你之后不会再过一会儿追一句了，私聊每条消息也只算一次话费。")
+        return ""
 
-    @filter.command("开启回复追发")
-    async def user_enable_followup(self, event: AstrMessageEvent):
-        """重新开启回复后决策和追发"""
-        uid = str(event.get_sender_id())
-        self.core.user_prefs.setdefault(uid, {})["followup_off"] = False
-        self.core.save_user_prefs()
-        yield _sys_reply(event, "【系统提示】已开启回复追发。")
-
-    @filter.command("主动消息频率")
-    async def user_set_active_freq(self, event: AstrMessageEvent, level: str = ""):
-        """调整主动消息频率：高 / 中 / 低"""
-        level = (level or "").strip()
-        if level not in self.core.FREQ_FACTORS:
-            uid = str(event.get_sender_id())
-            cur = self.core.user_prefs.get(uid, {}).get("freq", "中")
-            yield _sys_reply(event, f"【系统提示】当前频率：{cur}。发送“主动消息频率 高”、“主动消息频率 中”或“主动消息频率 低”来调整。")
-            return
-        uid = str(event.get_sender_id())
-        self.core.user_prefs.setdefault(uid, {})["freq"] = level
-        self.core.save_user_prefs()
-        tip = {"高": "等待时间减半，会更常来找你", "中": "恢复默认频率", "低": "等待时间翻倍，会少打扰你一些"}[level]
-        yield _sys_reply(event, f"【系统提示】主动消息频率已调成“{level}”：{tip}。下次你发消息后生效。")
-
-    @filter.command("主动消息")
-    async def test_initiative_message(self, event: AstrMessageEvent):
-        """手动触发主动消息测试"""
+    # ---------- 折叠转发：系统消息和角色说话区分开 ----------
+    def _node_chain(self, event: AstrMessageEvent, texts):
+        uin = str(event.get_self_id() or "0")
+        nodes = [Comp.Node(uin=uin, name=FORWARD_NAME, content=[Comp.Plain(t)]) for t in texts]
         try:
-            session_key = event.unified_msg_origin
-            session_id = (
-                await self.context.conversation_manager.get_curr_conversation_id(
-                    session_key
-                )
-            )
+            return [Comp.Nodes(nodes=nodes)]
+        except Exception:
+            return nodes
 
-            if not session_id:
-                await event.send(event.plain_result("无法获取当前会话ID，测试失败。"))
-                return
+    def forward_result(self, event: AstrMessageEvent, *texts):
+        return event.chain_result(self._node_chain(event, texts))
 
-            await event.send(
-                event.plain_result(
-                    f"正在为当前会话 (ID: {session_id}) 手动触发一次主动消息测试..."
-                )
-            )
-            bot_id = str(event.get_self_id() or "").strip()
-            if bot_id:
-                self.core.session_bot_ids[session_key] = bot_id
-            await self.core.trigger_idle_message(
-                session_key,
-                session_id,
-                bot_id=bot_id,
-            )
-            
+    async def send_forward(self, event: AstrMessageEvent, *texts):
+        try:
+            await event.send(MessageChain(chain=self._node_chain(event, texts)))
         except Exception as e:
-            logger.error(f"手动测试主动消息时出错: {e}", exc_info=True)
-            await event.send(event.plain_result(f"测试失败: {e}"))
+            logger.debug(f"[账本] 折叠消息发送失败，改发普通消息: {e}")
+            await event.send(MessageChain().message("\n\n".join(texts)))
+
+    async def send_private_forward(self, event: AstrMessageEvent, qq, *texts):
+        """私聊对方，用折叠转发；对方不是好友时退回临时会话普通消息"""
+        api = event.bot.api
+        uin = str(event.get_self_id() or "0")
+        msgs = [{"type": "node", "data": {"name": FORWARD_NAME, "uin": uin,
+                                          "content": [{"type": "text", "data": {"text": t}}]}} for t in texts]
+        try:
+            await api.call_action("send_private_forward_msg", user_id=int(qq), messages=msgs)
+            return True
+        except Exception as e:
+            logger.debug(f"[账本] 私聊折叠消息失败，改发普通消息: {e}")
+        kwargs = {"user_id": int(qq), "message": "\n\n".join(texts)}
+        if event.get_group_id():
+            kwargs["group_id"] = int(event.get_group_id())
+        try:
+            await api.call_action("send_private_msg", **kwargs)
+            return True
+        except Exception as e:
+            logger.debug(f"[账本] 私聊发送失败（可能不是好友）: {e}")
+            return False
+
+    def _cooldown_ok(self, qq):
+        cooldown = int(self.config.get("notice_cooldown_minutes", 30)) * 60
+        now = time.time()
+        if now - self._last_notice.get(qq, 0) < cooldown:
+            return False
+        self._last_notice[qq] = now
+        return True
+
+    def _wake_prefixes(self, event: AstrMessageEvent):
+        try:
+            cfg = self.context.get_config(umo=event.unified_msg_origin)
+        except TypeError:
+            cfg = self.context.get_config()
+        except Exception:
+            cfg = {}
+        wp = (cfg or {}).get("wake_prefix", ["/"])
+        if isinstance(wp, str):
+            wp = [wp]
+        return [p for p in wp if p] or ["/"]
+
+    async def _notify_insufficient(self, event: AstrMessageEvent, info):
+        """欠费到上限：私聊直接回系统消息；群聊给那条消息贴表情，再私聊发系统消息"""
+        qq = str(event.get_sender_id())
+        bal = (info or {}).get("balance", 0) if isinstance(info, dict) else 0
+        text = debt_notice(self.client.bot, max(-bal, 0) / 1_000_000)
+        group = event.get_group_id()
+        if not group:
+            await self.send_forward(event, text)
+            return
+        if event.get_platform_name() != "aiocqhttp":
+            return
+        api = event.bot.api
+        emoji = str(self.config.get("insufficient_emoji_id", "") or "").strip()
+        if emoji:
+            try:
+                await api.call_action("set_msg_emoji_like", message_id=event.message_obj.message_id, emoji_id=emoji)
+            except Exception as e:
+                logger.debug(f"[账本] 贴表情失败: {e}")
+        if self._cooldown_ok(qq):
+            await self.send_private_forward(event, qq, text)
+
+    # ---------- 聊天计费 ----------
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        qq = event.get_sender_id()
+        if not qq or event.get_extra("ledger_cid"):
+            return
+        group = event.get_group_id() or ""
+        text = (event.message_str or "").strip()
+        for p in self._wake_prefixes(event):
+            if text.startswith(p):
+                text = text[len(p):]
+                break
+        kind = "tell" if re.match(r"tell\S", text) else "chat"
+        ok, cid, info = await self.client.charge(
+            qq=qq, kind=kind, model=self._model_name(event), group_id=group, nickname=event.get_sender_name())
+        if not ok:
+            event.stop_event()
+            await self._notify_insufficient(event, info)
+            return
+        event.set_extra("ledger_llm", True)  # 标记：这条消息真的调用了模型（主动消息插件据此判断要不要做回复后决策）
+        if cid:
+            event.set_extra("ledger_cid", cid)
+        if self.config.get("charge_images", True):
+            n = sum(1 for c in event.message_obj.message if isinstance(c, Comp.Image))
+            for _ in range(n):
+                await self.client.charge(qq=qq, kind="image", model=self._model_name(event),
+                                         group_id=group, force=True)
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        cid = event.get_extra("ledger_cid")
+        if cid:
+            await self.client.settle(cid, True)
+            event.set_extra("ledger_cid", None)
+        # 模型最终失败、没走到这里的挂单，账本会在10分钟后自动退回
+
+    # ---------- 指令 ----------
+    async def _bill_texts(self, qq, nickname):
+        url = await self.client.login_link(qq, nickname)
+        line = ""
+        try:
+            b = await self.client.balance(qq)
+            bal = b["balance_usd"]
+            line = (f"当前欠费 ￥{-bal:.3f}，充值时会先扣除欠费。\n" if bal < 0
+                    else f"当前话费 ￥{bal:.3f}，大约还能聊 {b['chats_left']} 次。\n")
+        except Exception:
+            pass
+        intro = ("【系统提示-话费账本】\n" + line +
+                 "\n↓ 复制下面的链接，粘贴到手机自带的浏览器（Safari、Chrome 等）里打开，"
+                 "就能查看明细和充值。不要用QQ直接打开哦。\n"
+                 "链接24小时内有效，可以重复打开，不要发给别人。")
+        return intro, url
+
+    @filter.command("bill", alias={"Bill", "BILL"})
+    async def bill(self, event: AstrMessageEvent):
+        qq = event.get_sender_id()
+        try:
+            intro, url = await self._bill_texts(qq, event.get_sender_name())
+        except Exception as e:
+            logger.warning(f"[账本] 生成账本链接失败: {e}")
+            yield self.forward_result(event, "【系统提示】账本暂时连不上，过一会儿再试试。")
+            return
+        if not event.get_group_id():
+            yield self.forward_result(event, intro, url)
+            return
+        # 群里：链接发到小窗，群里只留一条折叠提示
+        if await self.send_private_forward(event, qq, intro, url):
+            yield self.forward_result(event, "【系统提示】话费小账本发给小窗啦！")
+        else:
+            yield self.forward_result(event, "【系统提示】账本链接要私聊发哦，私聊发送 bill 就行。")
+
+    @filter.command("billhelp", alias={"Billhelp", "BILLHELP", "billHelp"})
+    async def billhelp(self, event: AstrMessageEvent):
+        p = self._wake_prefixes(event)[0]
+        price, debt, free = 0.035, 0.35, 0
+        try:
+            b = await self.client.balance(event.get_sender_id())
+            price, debt, free = b.get("price", price), b.get("debt_limit", debt), b.get("free_daily", free)
+        except Exception:
+            pass
+        free_line = f"· 每人每天前 {free} 次调用免费\n" if free else ""
+        yield self.forward_result(event,
+            "【系统提示】话费小账本使用说明\n"
+            f"群聊里的指令前面要加唤醒词「{p}」，私聊直接发送bill或billhelp。\n"
+            "\n"
+            "查话费\n"
+            f"· {p}bill：查看话费、领取账本链接（群里发会送到小窗）\n"
+            f"· {p}billhelp：查看这份说明\n"
+            "\n"
+            "怎么计费\n"
+            f"· 角色每调用一次模型 ￥{price:.3f}\n"
+            "· 群聊一条消息算 1 次；私聊一条消息算 1 次（私聊开启回复追发时，私聊一条消息算2次，回复消息1次+判断是否追发消息1次）\n"
+            "· 每发一张图多算 1 次（识别图片）；记忆整理类指令按实际调用次数算，聊天到特定轮数自动总结或手动生成记忆都会计费。\n"
+            f"· 让角色互相说话（{p}tell名字 内容、{p}forw名字 内容）由发起的人付 1 次，之后角色之间的对话由公共钱包承担\n"
+            f"{free_line}"
+            f"· 最多可以欠 ￥{debt:.2f}，欠到上限角色会暂时没法回复，充值时先扣欠费\n"
+            "\n"
+            "主动消息（每个角色分开设置）\n"
+            f"· {p}关闭主动消息 / {p}开启主动消息：空闲时角色会不会主动找你\n"
+            f"· {p}主动消息频率 高 / 中 / 低：调整主动消息的频率，默认中（注意指令的高/中/低前有空格）。\n"
+            f"· {p}关闭回复追发 / {p}开启回复追发：角色回复后会不会过一会儿再追一句，开启时私聊每条消息算2次，默认关闭。"
+        )
+
+    async def terminate(self):
+        self.client.stop()
+        try:
+            await self.client.flush()
+        except Exception:
+            pass

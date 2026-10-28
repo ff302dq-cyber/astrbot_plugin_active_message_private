@@ -1,217 +1,42 @@
 {
-    "decision_provider_id": {
-        "type": "string",
-        "description": "决策模型服务商",
-        "hint": "选择专用于主动消息内容和跟进意图判断的模型提供商，留空使用默认模型。发送时间始终由代码随机，不由模型决定。",
-        "default": "",
-        "_special": "select_provider"
-    },
-    "decision_making_config": {
-        "description": "活着的Ta 功能开关",
-        "type": "object",
-        "items": {
-            "enable_decision_making": {
-                "type": "bool",
-                "description": "启用对话后决策/跟进功能",
-                "hint": "开启后，每次对话结束时，TA会根据记忆与聊天内容决定之后要干什么",
-                "default": true
-            }
-        }
-    },
-    "idle_check_config": {
-        "type": "object",
-        "description": "主动消息设置（统一的空闲检测）",
-        "items": {
-            "check_interval_seconds": {
-                "type": "int",
-                "description": "检查间隔(秒)",
-                "hint": "后台任务每隔多少秒检查一次空闲会话",
-                "default": 200
-            },
-            "idle_trigger_min_minutes": {
-                "type": "int",
-                "description": "最短触发时间(分钟)",
-                "hint": "代码会在最短和最长时间之间随机安排主动消息；模型不能指定时间。",
-                "default": 30
-            },
-            "idle_trigger_max_minutes": {
-                "type": "int",
-                "description": "最长触发时间(分钟)",
-                "hint": "实际触发时间由代码在最短和最长之间随机抽取。",
-                "default": 80
-            },
-            "max_consecutive_messages": {
-                "type": "int",
-                "description": "最大连续追发次数",
-                "hint": "在用户回复之前，最多连续发送主动消息的次数",
-                "default": 3
-            },
-            "trigger_probability": {
-                "type": "int",
-                "description": "触发概率(%)",
-                "hint": "满足空闲时间后实际发送的概率，0-100。设为80表示有80%概率发送，20%概率跳过",
-                "default": 80
-            },
-            "new_topic_probability": {
-                "type": "int",
-                "description": "新话题概率(%)",
-                "hint": "触发时选择开启新话题（而非续聊上下文）的概率，0-100。建议60以上，因为用户不回了通常表示不想继续旧话题",
-                "default": 60
-            },
-            "cleanup_inactive_days": {
-                "type": "int",
-                "description": "自动清理天数",
-                "hint": "超过这个天数没有活动的会话记录将被自动清理，设为0禁用",
-                "default": 10
-            }
-        }
-    },
-    "blacklist_config": {
-        "type": "object",
-        "description": "黑名单设置",
-        "items": {
-            "blacklist_enabled": {
-                "type": "bool",
-                "description": "启用黑名单",
-                "hint": "启用后，黑名单中的用户不会收到主动消息，其他用户正常",
-                "default": false
-            },
-            "blacklist_users": {
-                "type": "list",
-                "description": "黑名单用户ID列表",
-                "hint": "填写QQ号，这些用户不会收到主动消息",
-                "default": []
-            }
-        }
-    },
-    "group_chat_config": {
-        "type": "object",
-        "description": "群聊主动消息设置",
-        "items": {
-            "enable_group_active_message": {
-                "type": "bool",
-                "description": "允许在群聊中发送主动消息",
-                "hint": "关闭后，所有群聊都不会收到主动消息（默认关闭）。开启后群聊也会触发主动消息",
-                "default": false
-            },
-            "group_whitelist": {
-                "type": "list",
-                "description": "群聊白名单（可选）",
-                "hint": "兼容旧版设置。填写群号后只在这些群发送主动消息；留空则允许所有群。",
-                "default": []
-            },
-            "enable_in_group": {
-                "type": "bool",
-                "description": "旧版群聊开关",
-                "default": false,
-                "invisible": true
-            }
-        }
-    },
-    "quiet_hours_config": {
-        "type": "object",
-        "description": "免打扰设置",
-        "items": {
-            "quiet_hours_enabled": {
-                "type": "bool",
-                "description": "使用免打扰时间",
-                "hint": "开启后，在下方固定时段内不会发送主动消息。若角色作息插件正常运行，主动消息会自动服从它的随机睡眠和临时离开状态，此开关可以关闭；未使用作息插件时建议开启作为后备保护。",
-                "default": true
-            },
-            "quiet_hours_start": {
-                "type": "int",
-                "description": "免打扰开始时间 (小时, 0-23)",
-                "hint": "设置为23代表从晚上11点开始",
-                "default": 23
-            },
-            "quiet_hours_end": {
-                "type": "int",
-                "description": "免打扰结束时间 (小时, 0-23)",
-                "hint": "设置为7代表到早上7点结束",
-                "default": 7
-            }
-        }
-    },
-    "logging_config": {
-        "type": "object",
-        "description": "日志与调试开关",
-        "items": {
-            "log_periodic_check": {
-                "type": "bool",
-                "description": "记录定时检查日志",
-                "hint": "是否在控制台打印定时空闲检查日志，建议仅在调试时开启",
-                "default": false
-            },
-            "log_decision_json": {
-                "type": "bool",
-                "description": "记录决策JSON日志",
-                "hint": "是否在控制台打印TA返回的原始决策JSON，建议仅在调试时开启",
-                "default": false
-            },
-            "log_periodic_checks": {
-                "type": "bool",
-                "description": "旧版定时检查日志开关",
-                "default": false,
-                "invisible": true
-            }
-        }
-    },
-    "compatibility_config": {
-        "type": "object",
-        "description": "内部兼容迁移状态",
-        "invisible": true,
-        "items": {
-            "migration_version": {
-                "type": "int",
-                "description": "迁移版本",
-                "default": 0,
-                "invisible": true
-            }
-        }
-    },
-    "topic_prompt_config": {
-        "type": "object",
-        "description": "主动消息提示词",
-        "hint": "可用占位符：{人设} {角色名} {当前时间} {上次聊天时间} {沉默时长} {第几次} {核心记忆} {近期日记} {回忆片段} {对话历史}。清空即恢复内置提示词。",
-        "items": {
-            "stale_switch_enabled": {
-                "type": "bool",
-                "description": "间隔太久自动换新话题",
-                "hint": "距离上次聊天超过设定时长，就不再续聊旧话题，改为开启新话题",
-                "default": true
-            },
-            "stale_switch_hours": {
-                "type": "float",
-                "description": "换新话题的间隔（小时）",
-                "default": 3
-            },
-            "new_topic_prompt": {
-                "type": "text",
-                "description": "新话题提示词",
-                "default": "{人设}\n\n[系统指令：当前状态]\n你和用户上次聊天是在 {上次聊天时间}，到现在大约过了 {沉默时长}（你不能直接说出具体时长）。\n现在的时间是：{当前时间}。这是你第 {第几次} 次主动发消息。\n\n[你的任务：自然地开启一个新话题]\n用户不再回复了，说明上一个话题已经结束。你不应该再纠缠旧话题，而是像一个真实的人一样，自然地想到新的东西来聊。\n\n你可以从以下方向选择一个来开启新话题（任选其一，自然为主）：\n- **时间/环境联想**：根据当前时间（{当前时间}），聊聊你此刻在做什么、看到什么、吃了什么、天气怎么样。比如午后犯困、傍晚散步、夜里睡不着等。\n- **回忆联想**：从[过往回忆片段]里随机挑一段，自然地提起来，\"突然想到那次我们聊的那个…\"或者\"刚才看到一个什么东西让我想起…\"。\n- **日常分享**：分享一个小发现、一个想法、一个问题、看到的有趣的东西。\n- **轻松关心**：根据你对用户的了解（从记忆中），关心一下用户最近在忙的事。\n\n[核心规则]\n1. **严禁提及等待时长**：不准说\"过了3小时\"之类的话。\n2. **严禁纠缠旧话题**：不要试图接着上次的话题说。\n3. **符合当前时间**：说的话必须符合现在的时间，不要说和现在时段不符的话。\n4. **风格一致**：必须使用 {角色名} 的口吻和风格。\n5. **排重**：确保你说的话没有在近期重复过。\n6. **不要过度自责或撒娇**：自然一点，像真人一样随意开口就好。\n\n[参考资料]\n---\n[核心记忆]: {核心记忆}\n---\n[近期日记]: {近期日记}\n---\n[过往回忆片段（可用于联想灵感）]:\n{回忆片段}\n---\n[最近的对话历史（仅供了解上下文，不要续聊这些内容）]:\n{对话历史}\n---\n[指令]: 以 {角色名} 的身份，自然地开启一个全新的话题。输出一句话即可。\n"
-            },
-            "continue_prompt": {
-                "type": "text",
-                "description": "续聊提示词",
-                "default": "{人设}\n\n[系统指令：当前状态]\n你和用户上次聊天是在 {上次聊天时间}，到现在大约过了 {沉默时长}，之后用户一直没有回复。你仍在此情境中。\n现在的时间是：{当前时间}。这是你第 {第几次} 次主动发消息。\n\n[你的任务]\n1. 顺着[最近的对话历史]的逻辑，或根据你的人设，构思一句用于接续剧情的消息。\n2. 注意时间的变化：如果历史里的内容和当时的时间有关（比如吃午饭、出门、下班），而现在时段已经变了，就按现在的时间说话，不要再说当时的话。\n3. 风格、语气、是否使用旁白等，必须严格遵循 {角色名} 以及在历史中展现的对话风格。\n4. 排重检查：确保核心语义没有在近期重复过。\n5. 如果上下文中用户已经明确说了\"晚安\"\"去忙了\"等告别语，不要强行续聊，改为一句温暖的等候。\n\n[参考资料]\n---\n[核心记忆]: {核心记忆}\n---\n[近期日记]: {近期日记}\n---\n[最近的对话历史（assistant是你）]:\n{对话历史}\n---\n[指令]: 以 {角色名} 的口吻，输出一句【没有重复过的】、用于【自然接续】的新消息。\n"
-            }
-        }
-    },
-    "followup_config": {
-        "type": "object",
-        "description": "回复后追发",
-        "items": {
-            "followup_expire_enabled": {
-                "type": "bool",
-                "description": "追发保质期",
-                "hint": "回复后决策当场写好的追发消息，放太久就丢掉不发，避免说出过时的话",
-                "default": true
-            },
-            "followup_expire_minutes": {
-                "type": "int",
-                "description": "保质期（分钟）",
-                "default": 90
-            }
-        }
-    }
+  "ledger_url": {
+    "description": "账本地址",
+    "type": "string",
+    "default": "https://ledger.firejunjun.art"
+  },
+  "secret": {
+    "description": "账本口令（和 config.env 里的 LEDGER_SECRET 一样）",
+    "type": "string",
+    "default": "ajunandhuaiyi43"
+  },
+  "bot_name": {
+    "description": "这个Bot的角色名，用于明细显示，比如 甲",
+    "type": "string",
+    "default": ""
+  },
+  "exempt_qq": {
+    "description": "不计费的QQ号（比如你自己），多个用英文逗号隔开",
+    "type": "string",
+    "default": ""
+  },
+  "insufficient_emoji_id": {
+    "description": "欠费到上限时，在群里无法回复的消息上贴的表情ID（默认 111 是“可怜”），留空则不贴",
+    "type": "string",
+    "default": "111"
+  },
+  "notice_cooldown_minutes": {
+    "description": "群聊欠费时的私聊系统消息，同一个人多少分钟内只发一次",
+    "type": "int",
+    "default": 30
+  },
+  "charge_images": {
+    "description": "开启了图片转述时，每张图额外记一次",
+    "type": "bool",
+    "default": true
+  },
+  "offline_allowance": {
+    "description": "连不上账本时，每人最多先放行几次",
+    "type": "int",
+    "default": 5
+  }
 }
