@@ -1119,6 +1119,9 @@ class ActiveMessageCore:
         # 用户自己关闭了回复追发：不调用决策，也不花这次的钱
         if self._user_pref(session_key).get("followup_off"):
             return
+        # 只在角色真的用模型回复之后才做决策；bill、开关指令这类指令回复不做（也不扣费）
+        if "astrbot_ledger" in _ledger_sys.modules and not event.get_extra("ledger_llm"):
+            return
                 
         result = event.get_result()
         result_text = result.get_plain_text().strip() if result else ""
