@@ -214,6 +214,9 @@ class ActiveMessageCore:
         self.instance_id = uuid4().hex[:8]
         self.user_prefs = {}
         self.load_user_prefs()
+        # 让话费小账本的 billhelp 能查到每个人在这个角色这里的设置
+        import types as _types
+        _ledger_sys.modules["astrbot_activemessage"] = _types.SimpleNamespace(status=self.user_status)
 
         # 停止标志：一旦设为True，所有发送操作立即中止
         self._stopped = False
@@ -260,6 +263,27 @@ class ActiveMessageCore:
                 json.dump(self.user_prefs, f, ensure_ascii=False)
         except Exception as e:
             logger.error(f"activemessage: 保存用户设置失败: {e}")
+
+    def _followup_default_on(self) -> bool:
+        dc = self.config.get("decision_making_config", {}) or {}
+        return bool(dc.get("followup_default_on", False))
+
+    def _followup_on(self, session_key: str) -> bool:
+        pref = self._user_pref(session_key)
+        if "followup_off" in pref:
+            return not pref["followup_off"]
+        if self._is_group_chat(session_key):
+            return False
+        return self._followup_default_on()
+
+    def user_status(self, qq) -> dict:
+        """某个人在这个角色这里的主动消息设置（私聊）"""
+        prefs = getattr(self, "user_prefs", {}).get(str(qq), {})
+        dc = self.config.get("decision_making_config", {}) or {}
+        enabled = bool(dc.get("enable_decision_making", True))
+        followup = (not prefs["followup_off"]) if "followup_off" in prefs else self._followup_default_on()
+        return {"idle_on": not prefs.get("off", False), "freq": prefs.get("freq", "中"),
+                "followup_on": enabled and followup, "followup_enabled": enabled}
 
     def _user_pref(self, session_key: str) -> dict:
         if self._is_group_chat(session_key):
@@ -1116,8 +1140,8 @@ class ActiveMessageCore:
         decision_config = self.config.get("decision_making_config", {})
         if not decision_config.get("enable_decision_making", True):
             return
-        # 用户自己关闭了回复追发：不调用决策，也不花这次的钱
-        if self._user_pref(session_key).get("followup_off"):
+        # 这个人没开回复追发（默认关闭，可在设置里改默认）：不调用决策，也不花这次的钱
+        if not self._followup_on(session_key):
             return
         # 只在角色真的用模型回复之后才做决策；bill、开关指令这类指令回复不做（也不扣费）
         if "astrbot_ledger" in _ledger_sys.modules and not event.get_extra("ledger_llm"):
